@@ -6,7 +6,7 @@
 ;; URL: https://github.com/emacs-pe/vc-link.el
 ;; Keywords: vc tools convenience
 ;; Version: 0.1
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "30.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -72,8 +72,19 @@
 
 ;;; Code:
 (require 'format-spec)
+(require 'subr-x)
+(require 'url-parse)
+(require 'url-util)
 
-(defvar vc-link-forge-alist
+(declare-function vc-hg-command "vc-hg")
+(declare-function vc-git--run-command-string "vc-git")
+
+(defgroup vc-link nil
+  "Get the URL of the current buffer."
+  :group 'vc
+  :prefix "vc-link-")
+
+(defcustom vc-link-forge-alist
   '(("github.com"             github    "https")
     ("gitea.com"              gitea     "https")
     ("codeberg.org"           gitea     "https")
@@ -89,131 +100,191 @@
     ("pagure.io"              pagure    "https")
     ("src.fedoraproject.org"  pagure    "https")
     ("sr.ht"                  sourcehut "https"))
-  "An alist of forge instances.")
+  "An alist of forge instances."
+  :type '(repeat (list (string :tag "Host domain")
+                       (choice
+                        (const github)
+                        (const gitlab)
+                        (const gitea)
+                        (const bitbucket)
+                        (const savannah)
+                        (const pagure)
+                        (const sourcehut)
+                        (string :tag "URL format")
+                        (plist :tag "Rules"
+                               :options ((:url string)
+                                         (:hg-url string)
+                                         (:anchor string)
+                                         (:anchor-range string)
+                                         (:name (const last)))))
+                       (string :tag "Protocol"))))
 
-(defvar vc-link--vc-alist nil)
+(defcustom vc-link-remote-names '("upstream" nil)
+  "Names of the remotes to look for when building a link.
+The value nil refers to the default remote e.g. \"origin\" for Git."
+  :type '(repeat (choice (string :tag "Remote name")
+                         (const :tag "Default remote" nil)))
+  :safe #'listp)
 
-(defun vc-link--vc-alist (&optional rebuild)
-  "Generate the `vc-link--vc-alist' alist.
-If REBUILD is non-nil, generate it again."
-  (if (and vc-link--vc-alist (null rebuild))
-      vc-link--vc-alist
-    (setq vc-link--vc-alist
-          (mapcar (lambda (entry)
-                    (apply #'vc-link--forge-setup entry))
-                  vc-link-forge-alist))))
+(defconst vc-link-forge-types
+  '((github
+     :url "%P://%H/%n/blob/%r/%f"
+     :anchor "#L%s"
+     :anchor-range "#L%s-L%e")
+    (gitlab
+     :url "%P://%H/%n/-/blob/%r/%f"
+     :anchor "#L%s"
+     :anchor-range "#L%s-%e")
+    (gitea
+     :url "%P://%H/%n/src/commit/%r/%f"
+     :anchor "#L%s"
+     :anchor-range "#L%s-L%e")
+    (bitbucket
+     :url "%P://%H/%n/src/%r/%f"
+     :anchor "#lines-%s"
+     :anchor-range "#lines-%s:%e")
+    (savannah
+     :name last
+     :url "%P://%H/cgit/%n/tree/%f?id=%r"
+     :anchor "#n%s")
+    (pagure
+     :url "%P://%H/%n/blob/%r/f/%f"
+     :anchor "#_%s"
+     :anchor-range "#_%s-%e")
+    (sourcehut
+     :url "%P://%H/%n/tree/%r/%f"
+     :hg-url "%P://%H/%n/browse/%f?rev=%r"
+     :anchor "#L%s"))
+  "The URL layout of each forge type of `vc-link-forge-alist'.
 
-(defun vc-link--region ()
-  "Capture lines of the selected region otherwise current line."
-  (save-restriction
-    (widen)
-    (if (use-region-p)
-        (let ((start (line-number-at-pos (region-beginning)))
-              (end (line-number-at-pos (region-end))))
-          (if (= start end)
-              (list start)
-            (cons start end)))
-      (list (line-number-at-pos)))))
+Template values:
+    ?P    protocol
+    ?H    host
+    ?n    repository name
+    ?r    revision
+    ?f    filename
+    ?s    start line
+    ?e    end line")
 
-(defun vc-link--match-groups (string)
-  "Return the captured regexp groups from `match-data' in STRING."
-  (let (groups)
-    (dotimes (i (/ (length (match-data)) 2))
-      (push (match-string i string) groups))
-    (nreverse groups)))
+(defun vc-link--forge-entry (host)
+  "Fetch the `vc-link-forge-alist' entry for HOST."
+  (when host
+    (let ((labels (string-split host "\\.")))
+      (seq-some (lambda (i)
+                  (assoc-string (string-join (seq-drop labels i) ".")
+                                vc-link-forge-alist t))
+                (number-sequence 0 (1- (length labels)))))))
 
-(declare-function vc-hg-command "vc-hg")
+(defun vc-link--lines ()
+  "Return the range of selected lines as (START . END)."
+  (if (use-region-p)
+      (let* ((beg (region-beginning))
+             (last (line-number-at-pos (max beg (min (region-end) (1- (point-max)))) t))
+             (first (line-number-at-pos beg t)))
+        (cons first (unless (= first last) last)))
+    (cons (line-number-at-pos (point) t) nil)))
 
-(defun vc-link-spec (backend &rest extra)
-  "Return the format spec for vc BACKEND and EXTRA pairs."
-  (unless (zerop (% (length extra) 2))
-    (error "Obscure usage of this function appeared"))
-  (let* ((root (vc-call-backend backend 'root default-directory))
-         (rev (if (eq backend 'Hg)
-                  (with-output-to-string ; `vc-hg' uses revisions, instead of changeset ids.
-                    (vc-hg-command standard-output 0 nil "log" "-r" "." "--template" "{node}"))
-                (vc-call-backend backend 'working-revision root)))
-         (pairs (if buffer-file-name
-                    (if (vc-call-backend backend 'registered buffer-file-name)
-                        (let ((lines (vc-link--region)))
-                          (list ?r rev ?s (car-safe lines) ?e (cdr-safe lines)
-                                ?f (file-relative-name buffer-file-name root)))
-                      (user-error "File is not registered in VC %s: %s" backend buffer-file-name))
-                  (list ?r rev ?f (file-relative-name default-directory root)))))
-    (apply #'format-spec-make (append pairs extra))))
+(defun vc-link--parse-remote (remote)
+  "Parse the repository REMOTE as (HOST . PATH)."
+  (let* ((colon (string-search ":" remote))
+         (prefix (and colon (substring remote 0 colon)))
+         ;; Handle ssh URLs of the form git@github.com:owner/repo.git
+         (ssh (and prefix
+                   (not (string-search "/" prefix))
+                   (not (string-search "://" remote))))
+         (url (ignore-errors
+                (url-generic-parse-url
+                 (if ssh
+                     (concat "ssh://" prefix "/" (substring remote (1+ colon)))
+                   remote)))))
+    (when-let* ((host (and url (url-host url)))
+                ((not (seq-empty-p host)))
+                (path (string-trim (or (and url (car (url-path-and-query url))) "") "/+" "/+"))
+                ((not (seq-empty-p path))))
+      (cons (downcase host) path))))
 
-(cl-defgeneric vc-link--forge-setup (host-domain forge-type protocol)
-  "Build an entry for `vc-link--vc-alist'.")
+(defun vc-link--forge-link (entry backend host path rev file)
+  "Generate the link from ENTRY for BACKEND, HOST, PATH, REV, and FILE."
+  (pcase-let* ((`(,domain ,forge ,protocol) entry)
+               (rules (pcase forge
+                        ((pred symbolp)
+                         (or (alist-get forge vc-link-forge-types) (user-error "Unknown forge type %S in `vc-link-forge-alist'" forge)))
+                        ((pred stringp) (list :url forge))
+                        (_ forge)))
+               (name (if (eq (plist-get rules :name) 'last)
+                         (file-name-nondirectory path)
+                       (string-remove-suffix ".git" path)))
+               (url (or (and (eq backend 'Hg) (plist-get rules :hg-url))
+                        (plist-get rules :url)
+                        (user-error "No `:url' for the forge of %s" domain)))
+               (root (vc-call-backend backend 'root file))
+               (file-rel (file-relative-name file root))
+               (file-path (if (string-equal file-rel "./") "" (url-hexify-string file-rel (cons ?/ url-unreserved-chars))))
+               (spec (format-spec-make ?P protocol ?H host ?n name ?r rev ?f file-path)))
+    (if (file-directory-p file)
+        (format-spec url spec)
+      (pcase-let* ((`(,start . ,end) (vc-link--lines))
+                   (anchor (or (and end (plist-get rules :anchor-range))
+                               (plist-get rules :anchor))))
+        (concat (format-spec url spec)
+                (and anchor (format-spec anchor (format-spec-make ?s start ?e end))))))))
 
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'github)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\([.A-Za-z0-9_/-]+?\\)\\(?:\\.git\\)?/?\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       (format-spec (concat "%P://%H/%n/blob/%r/%f" (and (cdr (assq ?s spec)) "#L%s") (and (cdr (assq ?e spec)) "-L%e")) spec)))))
+(defun vc-link--remote (backend file-or-dir)
+  "Return the remote of BACKEND of FILE-OR-DIR as (REMOTE . URL)."
+  (seq-some (lambda (remote)
+              (when-let* ((url (ignore-errors
+                                 (vc-call-backend backend 'repository-url
+                                                  file-or-dir remote)))
+                          ((not (seq-empty-p url))))
+                (cons remote url)))
+            vc-link-remote-names))
 
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'gitlab)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\([.A-Za-z0-9_/-]+?\\)\\(?:\\.git\\)?/?\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       (format-spec (concat "%P://%H/%n/-/blob/%r/%f" (and (cdr (assq ?s spec)) "#L%s") (and (cdr (assq ?e spec)) "-L%e")) spec)))))
-
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'gitea)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\([.A-Za-z0-9_/-]+?\\)\\(?:\\.git\\)?/?\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       (format-spec (concat "%P://%H/%n/src/commit/%r/%f" (and (cdr (assq ?s spec)) "#L%s") (and (cdr (assq ?e spec)) "-L%e")) spec)))))
-
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'bitbucket)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\([.A-Za-z0-9_/-]+?\\)\\(?:\\.git\\)?/?\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       (format-spec (concat "%P://%H/%n/src/%r/%f" (and (cdr (assq ?s spec)) "#lines-%s") (and (cdr (assq ?e spec)) ":%e")) spec)))))
-
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'savannah)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\(?:\\(?:srv/\\)?git/\\)?\\([.A-Za-z0-9_/-]+?\\.git\\)\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       ;; N.B. cgit, used by GNU Savannah, doesn't support multi-line links
-       (format-spec (concat "%P://%H/cgit/%n/tree/%f?id=%r" (and (cdr (assq ?s spec)) "#n%s")) spec)))))
-
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'pagure)) protocol)
-  (cons
-   (concat "[/@]" (regexp-quote host-domain) "[/:]\\([.A-Za-z0-9_/-]+?\\)\\(?:\\.git\\)?/?\\'")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H host-domain ?n (nth 1 groups))))
-       (format-spec (concat "%P://%H/%n/blob/%r/f/%f" (and (cdr (assq ?s spec)) "#_%s") (and (cdr (assq ?e spec)) "-%e")) spec)))))
-
-(cl-defmethod vc-link--forge-setup (host-domain (_forge-type (eql 'sourcehut)) protocol)
-  (cons
-   (concat "[/@]\\(\\(?:git\\|hg\\)." (regexp-quote host-domain) "\\)" "[/:]\\(~[.A-Za-z0-9_/-]+\\)")
-   (lambda (backend groups)
-     (let ((spec (vc-link-spec backend ?P protocol ?H (nth 1 groups) ?n (nth 2 groups))))
-       ;; N.B. Sourcehut doesn't support multi-line links
-       (format-spec (concat (if (eq backend 'Hg) "%P://%H/%n/browse/%f?rev=%r" "%P://%H/%n/tree/%r/%f") (and (cdr (assq ?s spec)) "#L%s")) spec)))))
+(defun vc-link--remote-has-revision-p (backend remote rev)
+  "Check whether REMOTE of BACKEND is known to have REV."
+  (pcase backend
+    ('Git
+     (seq-empty-p
+      (ignore-errors
+        (require 'vc-git)
+        (vc-git--run-command-string nil "rev-list" "--max-count=1" rev "--not" (concat "--remotes=" (or remote "origin"))))))
+    (_ t)))
 
 ;;;###autoload
-(defun vc-link ()
-  "Fetch the current vc url."
-  (interactive)
-  (if-let*
-      ((file-or-dir (or buffer-file-name default-directory))
-       (backend (vc-responsible-backend file-or-dir 'no-error))
-       (repo (seq-some (lambda (remote)
-                         (ignore-errors
-                           (vc-call-backend backend 'repository-url
-                                            file-or-dir remote)))
-                       '("upstream" nil)))
-       (link (seq-some (lambda (config)
-                         (when (string-match (car-safe config) repo)
-                           (funcall (cdr-safe config) backend (vc-link--match-groups repo))))
-                       (vc-link--vc-alist))))
-      (kill-new (message "%s" link))
-    (user-error "Could not build a remote link")))
+(defun vc-link (&optional arg)
+  "Fetch the current vc URL.
+With prefix ARG, open the URL with `browse-url'."
+  (interactive "P")
+  (pcase-let*
+      ((file (or buffer-file-name default-directory))
+       (backend (or (vc-responsible-backend file 'no-error)
+                    (user-error "No VC backend is responsible for %s" file)))
+       (`(,remote . ,url) (or (vc-link--remote backend file)
+                              (user-error "No repository URL found for %s" file)))
+       (`(,host . ,path) (or (vc-link--parse-remote (string-trim url))
+                             (user-error "The remote of %s is not a URL: %s" file url)))
+       (entry (or (vc-link--forge-entry host)
+                  (user-error "No forge in `vc-link-forge-alist' matches the remote URL %s" url)))
+       (rev (or (if (eq backend 'Hg)
+                    ;; `vc-hg' until Emacs 32 uses local revisions, instead of changeset hashes.
+                    ;; See https://github.com/emacs-mirror/emacs/commit/7ce60be53e7ffbc1972dd8e98744adf6103eee9e
+                    (progn
+                      (require 'vc-hg)
+                      (with-output-to-string
+                        (vc-hg-command standard-output 0 nil "log" "-r" "." "--template" "{node}")))
+                  (vc-call-backend backend 'working-revision file))
+                (user-error "The repository of %s has no commits yet" file)))
+       (link (vc-link--forge-link entry backend host path rev file)))
+    (pcase (vc-state file backend)
+      ('added
+       (lwarn 'vc-link :warning "File is not committed yet, the link may not resolve: %s" file))
+      ('unregistered
+       (lwarn 'vc-link :warning "File is not registered in VC %s, the link may not resolve: %s" backend file)))
+    (unless (vc-link--remote-has-revision-p backend remote rev)
+      (lwarn 'vc-link :warning "Revision %s is not among the fetched refs of the %s remote, the link may not resolve: %s" rev (or remote "default") file))
+    (if arg
+        (browse-url link)
+      (kill-new (message "%s" link)))
+    link))
 
 (provide 'vc-link)
 ;;; vc-link.el ends here
